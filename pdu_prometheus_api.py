@@ -1,90 +1,79 @@
+# Optimized PDU Power Monitoring - Using YAML Config + PySNMP
+
 from fastapi import FastAPI, Response
 from datetime import datetime
-import subprocess
 import time
 import yaml
-import threading
+from pysnmp.hlapi import *
 
 app = FastAPI()
 
-# --- Config loader with auto-reload ---
-CONFIG_PATH = "config.yaml"
-CONFIG = {}
-CONFIG_LOCK = threading.Lock()
-
-
-def load_pdu_config():
-    global CONFIG
+# --- Load config from YAML ---
+def load_pdu_config(yaml_path="pdu_config.yaml"):
     try:
-        with open(CONFIG_PATH, "r") as f:
-            loaded = yaml.safe_load(f)
-            with CONFIG_LOCK:
-                CONFIG = loaded
-            print("[INFO] Config reloaded.")
+        with open(yaml_path, "r") as f:
+            return yaml.safe_load(f)
     except Exception as e:
-        print(f"[ERROR] Failed to reload config: {e}")
+        print(f"[ERROR] Failed to load YAML config: {e}")
+        return {}
+
+CONFIG = load_pdu_config()
+PDU_IP = CONFIG["pdu"]["ip"]
+VOLTAGE_OID = CONFIG["pdu"]["voltage_oid"]
+ENERGY_OID = CONFIG["pdu"]["energy_oid"]
+COMPUTES = CONFIG["pdu"]["servers"]
+
+# --- SNMP Utility (pysnmp) ---
+def snmp_get(ip, oid, community="public", port=161):
+    iterator = getCmd(
+        SnmpEngine(),
+        CommunityData(community, mpModel=0),
+        UdpTransportTarget((ip, port), timeout=2.0, retries=1),
+        ContextData(),
+        ObjectType(ObjectIdentity(oid))
+    )
+    errorIndication, errorStatus, errorIndex, varBinds = next(iterator)
+
+    if errorIndication:
+        raise Exception(f"SNMP error: {errorIndication}")
+    elif errorStatus:
+        raise Exception(f"SNMP error: {errorStatus.prettyPrint()} at {errorIndex}")
+    else:
+        for varBind in varBinds:
+            return str(varBind).split("=")[1].strip()
 
 
-def auto_reload_config(interval=60):
-    def loop():
-        while True:
-            time.sleep(interval)
-            load_pdu_config()
-    thread = threading.Thread(target=loop, daemon=True)
-    thread.start()
+# --- Data parsing helpers ---
+def spl_current(val):
+    return 0.001 * int(val)
+
+def spl_voltage(val):
+    return 0.01 * int(val)
+
+def spl_energy(val):
+    return 10 * int(val)
 
 
-def snmp_walk(ip, oid_root="1.3.6.1.4.1.42578"):
-    try:
-        result = subprocess.check_output([
-            "snmpwalk", "-v1", "-c", "public", ip, oid_root
-        ]).decode("utf-8")
-        return result.splitlines()
-    except Exception as e:
-        return [f"# SNMP walk failed: {e}"]
-
-
-# --- SNMP Parsing Helpers ---
-def spl_current(data):
-    return 0.001 * int(data.split(":")[1])
-
-def spl_voltage(data):
-    return 0.01 * int(data.split(":")[1])
-
-def spl_energy(data):
-    return 10 * int(data.split(":")[1])
-
-def snmp_get(ip, oid):
-    result = subprocess.Popen(
-        ["snmpget", "-v1", "-c", "public", ip, oid],
-        stdout=subprocess.PIPE
-    ).communicate()[0].decode("utf-8")
-    return result
-
-
-# --- Sensor Logic ---
+# --- Main SNMP Reading and Metrics Logic ---
 def get_sensor_data():
     start = time.time()
     result_lines = []
 
-    with CONFIG_LOCK:
-        ip = CONFIG["pdu"]["ip"]
-        voltage_oid = CONFIG["pdu"]["voltage_oid"]
-        energy_oid = CONFIG["pdu"]["energy_oid"]
-        computes = CONFIG["pdu"]["servers"]
-
     try:
-        voltage = spl_voltage(snmp_get(ip, voltage_oid))
-        total_energy = spl_energy(snmp_get(ip, energy_oid))
+        voltage_raw = snmp_get(PDU_IP, VOLTAGE_OID)
+        energy_raw = snmp_get(PDU_IP, ENERGY_OID)
+        voltage = spl_voltage(voltage_raw)
+        total_energy = spl_energy(energy_raw)
     except Exception as e:
         return f"# Error fetching shared voltage/energy: {e}"
 
     compute_data = []
     total_current = 0.0
 
-    for compute in computes:
+    for compute in COMPUTES:
         try:
-            current = spl_current(snmp_get(ip, compute["current_oid"]))
+            current_raw = snmp_get(PDU_IP, compute["current_oid"])
+            current = spl_current(current_raw)
         except Exception as e:
             print(f"[Error] SNMP fail for {compute['name']}: {e}")
             continue
@@ -114,31 +103,12 @@ def get_sensor_data():
     print(f"[INFO] SNMP scrape completed in {round(end - start, 2)} sec")
     return "\n".join(result_lines)
 
-
-# --- API Endpoints ---
 @app.get("/metrics")
 async def metrics():
     sensor_data = get_sensor_data()
     print("[INFO] /metrics hit @", datetime.now())
     return Response(sensor_data, media_type="text/plain")
 
-
-@app.get("/reload")
-async def reload_config():
-    load_pdu_config()
-    return {"status": "reloaded"}
-
-
-@app.get("/walk")
-async def walk():
-    with CONFIG_LOCK:
-        ip = CONFIG["pdu"]["ip"]
-    return {"oids": snmp_walk(ip)}
-
-
-# --- Startup ---
 if __name__ == "__main__":
-    load_pdu_config()
-    auto_reload_config(interval=60)
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8099)
